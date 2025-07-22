@@ -1,7 +1,8 @@
 package logr
 
 import (
-    "bufio" // Import bufio for buffered I/O
+    "bufio"
+    "bytes"
     "compress/gzip"
     "fmt"
     "io"
@@ -12,6 +13,13 @@ import (
     "sync"
     "time"
 )
+
+// bufferPool is a pool of bytes.Buffer objects to reduce memory allocations.
+var bufferPool = sync.Pool{
+    New: func() interface{} {
+        return &bytes.Buffer{}
+    },
+}
 
 // LogLevel represents the logging level.
 type LogLevel int
@@ -225,21 +233,28 @@ func (l *Logger) shouldRotate(messageSize int) bool {
 }
 
 // writeLog formats and writes a log message.
-func (l *Logger) writeLog(level LogLevel, message string) {
+func (l *Logger) writeLog(level LogLevel, format string, args ...interface{}) {
     // Check the log level before doing any work.
     if level < l.config.Level {
         return
     }
 
-    // Format the log message outside the lock to reduce contention.
+    // Get a buffer from the pool.
+    buf := bufferPool.Get().(*bytes.Buffer)
+    buf.Reset()
+    defer bufferPool.Put(buf)
+
+    // Format the log message into the buffer.
     timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-    logMessage := fmt.Sprintf("[%s] [%s] %s\n", timestamp, level.String(), message)
+    fmt.Fprintf(buf, "[%s] [%s] ", timestamp, level.String())
+    fmt.Fprintf(buf, format, args...)
+    buf.WriteByte('\n')
 
     l.mu.Lock()
     defer l.mu.Unlock()
 
     // Check if rotation is needed before writing.
-    if l.shouldRotate(len(logMessage)) {
+    if l.shouldRotate(buf.Len()) {
         if err := l.rotateFile(); err != nil {
             fmt.Fprintf(os.Stderr, "log rotation failed: %v\n", err)
             return // Do not write the log if rotation fails.
@@ -248,7 +263,7 @@ func (l *Logger) writeLog(level LogLevel, message string) {
 
     // Write to the buffered writer.
     if l.writer != nil {
-        n, err := l.writer.WriteString(logMessage)
+        n, err := l.writer.Write(buf.Bytes())
         if err != nil {
             fmt.Fprintf(os.Stderr, "failed to write to log file: %v\n", err)
             return
@@ -258,38 +273,33 @@ func (l *Logger) writeLog(level LogLevel, message string) {
 
     // Also write to stdout if enabled.
     if l.config.EnableStdout {
-        fmt.Print(logMessage)
+        os.Stdout.Write(buf.Bytes())
     }
 }
 
 // Debug logs a message at the DEBUG level.
 func (l *Logger) Debug(format string, args ...interface{}) {
-    message := fmt.Sprintf(format, args...)
-    l.writeLog(DEBUG, message)
+    l.writeLog(DEBUG, format, args...)
 }
 
 // Info logs a message at the INFO level.
 func (l *Logger) Info(format string, args ...interface{}) {
-    message := fmt.Sprintf(format, args...)
-    l.writeLog(INFO, message)
+    l.writeLog(INFO, format, args...)
 }
 
 // Warn logs a message at the WARN level.
 func (l *Logger) Warn(format string, args ...interface{}) {
-    message := fmt.Sprintf(format, args...)
-    l.writeLog(WARN, message)
+    l.writeLog(WARN, format, args...)
 }
 
 // Error logs a message at the ERROR level.
 func (l *Logger) Error(format string, args ...interface{}) {
-    message := fmt.Sprintf(format, args...)
-    l.writeLog(ERROR, message)
+    l.writeLog(ERROR, format, args...)
 }
 
 // Fatal logs a message at the FATAL level and then exits the program.
 func (l *Logger) Fatal(format string, args ...interface{}) {
-    message := fmt.Sprintf(format, args...)
-    l.writeLog(FATAL, message)
+    l.writeLog(FATAL, format, args...)
     l.syncAndExit()
 }
 
