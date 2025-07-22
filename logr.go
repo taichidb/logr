@@ -4,6 +4,7 @@ import (
     "bufio"
     "bytes"
     "compress/gzip"
+    "encoding/json"
     "fmt"
     "io"
     "os"
@@ -58,9 +59,12 @@ type Config struct {
     MaxAge       time.Duration // MaxAge is the maximum time to retain old log files.
     MaxBackups   int           // MaxBackups is the maximum number of old log files to retain.
     Level        LogLevel      // Level is the logging level.
-    EnableStdout bool          // EnableStdout controls whether logs are also written to standard output.
+    EnableStdout bool          // EnableStdout is a convenience option to log to os.Stdout.
     SyncInterval time.Duration // SyncInterval is the interval for periodic syncs (0 disables periodic syncs).
     Compress     bool          // Compress controls whether rotated log files are compressed with gzip.
+    JSONFormat   bool          // JSONFormat controls whether logs are formatted as JSON.
+    Output       io.Writer     // Output allows specifying a custom writer. It overrides EnableStdout if set.
+    ErrorHandler func(error)   // ErrorHandler is a callback for handling internal logger errors.
 }
 
 // DefaultConfig returns the default logger configuration.
@@ -75,6 +79,9 @@ func DefaultConfig() *Config {
         EnableStdout: false,
         SyncInterval: 100 * time.Millisecond, // 100ms periodic sync by default
         Compress:     true,                   // Compression enabled by default
+        JSONFormat:   false,
+        Output:       nil,
+        ErrorHandler: nil,
     }
 }
 
@@ -82,7 +89,7 @@ func DefaultConfig() *Config {
 type Logger struct {
     config      *Config
     file        *os.File
-    writer      *bufio.Writer // Use a buffered writer for performance.
+    out         io.Writer // Combined output writer (file + custom/stdout)
     currentSize int64
     mu          sync.Mutex
     syncTicker  *time.Ticker
@@ -122,7 +129,7 @@ func NewLogger(config *Config) (*Logger, error) {
     return logger, nil
 }
 
-// openLogFile opens or creates the log file and initializes the buffered writer.
+// openLogFile opens or creates the log file and sets up the output writers.
 func (l *Logger) openLogFile() error {
     logPath := l.getCurrentLogPath()
 
@@ -130,7 +137,6 @@ func (l *Logger) openLogFile() error {
     if info, err := os.Stat(logPath); err == nil {
         l.currentSize = info.Size()
     } else if !os.IsNotExist(err) {
-        // Return an error if stat fails for a reason other than the file not existing.
         return fmt.Errorf("failed to get log file info: %v", err)
     } else {
         l.currentSize = 0
@@ -141,10 +147,29 @@ func (l *Logger) openLogFile() error {
     if err != nil {
         return fmt.Errorf("failed to open log file: %v", err)
     }
-
     l.file = file
-    l.writer = bufio.NewWriter(file)
+
+    // Set up the multi-writer.
+    fileWriter := bufio.NewWriter(file)
+    outputs := []io.Writer{fileWriter}
+
+    if l.config.Output != nil {
+        outputs = append(outputs, l.config.Output)
+    } else if l.config.EnableStdout {
+        outputs = append(outputs, os.Stdout)
+    }
+    l.out = io.MultiWriter(outputs...)
+
     return nil
+}
+
+// handleError provides a centralized way to handle internal errors.
+func (l *Logger) handleError(err error) {
+    if l.config.ErrorHandler != nil {
+        l.config.ErrorHandler(err)
+    } else {
+        fmt.Fprintf(os.Stderr, "logr error: %v\n", err)
+    }
 }
 
 // getCurrentLogPath returns the path to the current log file.
@@ -189,14 +214,18 @@ func (l *Logger) compressFile(srcPath, dstPath string) error {
 // rotateFile handles log rotation.
 func (l *Logger) rotateFile() error {
     // Flush the buffer and close the current file.
-    if l.writer != nil {
-        if err := l.writer.Flush(); err != nil {
-            fmt.Fprintf(os.Stderr, "Warning: failed to flush writer during rotation: %v\n", err)
+    if f, ok := l.out.(*io.MultiWriter); ok {
+        for _, w := range getWriters(f) {
+            if b, ok := w.(*bufio.Writer); ok {
+                if err := b.Flush(); err != nil {
+                    l.handleError(fmt.Errorf("failed to flush writer during rotation: %v", err))
+                }
+            }
         }
     }
     if l.file != nil {
         if err := l.file.Close(); err != nil {
-            fmt.Fprintf(os.Stderr, "Warning: failed to close file during rotation: %v\n", err)
+            l.handleError(fmt.Errorf("failed to close file during rotation: %v", err))
         }
     }
 
@@ -207,17 +236,15 @@ func (l *Logger) rotateFile() error {
     if l.config.Compress {
         backupPath := l.getBackupLogPath(timestamp)
         if err := l.compressFile(currentPath, backupPath); err != nil {
-            // Try to reopen the original file if compression fails to avoid losing logs.
             l.openLogFile()
             return fmt.Errorf("failed to compress log file: %v", err)
-        }
+        }!
         if err := os.Remove(currentPath); err != nil {
-            fmt.Fprintf(os.Stderr, "Warning: failed to remove original log file after compression: %v\n", err)
+            l.handleError(fmt.Errorf("failed to remove original log file after compression: %v", err))
         }
     } else {
         backupPath := l.getBackupLogPath(timestamp)
         if err := os.Rename(currentPath, backupPath); err != nil {
-            // Try to reopen the original file if rename fails.
             l.openLogFile()
             return fmt.Errorf("failed to rename log file: %v", err)
         }
@@ -234,46 +261,52 @@ func (l *Logger) shouldRotate(messageSize int) bool {
 
 // writeLog formats and writes a log message.
 func (l *Logger) writeLog(level LogLevel, format string, args ...interface{}) {
-    // Check the log level before doing any work.
     if level < l.config.Level {
         return
     }
 
-    // Get a buffer from the pool.
     buf := bufferPool.Get().(*bytes.Buffer)
     buf.Reset()
     defer bufferPool.Put(buf)
 
-    // Format the log message into the buffer.
-    timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-    fmt.Fprintf(buf, "[%s] [%s] ", timestamp, level.String())
-    fmt.Fprintf(buf, format, args...)
-    buf.WriteByte('\n')
+    if l.config.JSONFormat {
+        // JSON format
+        logEntry := map[string]interface{}{
+            "time":    time.Now().Format(time.RFC3339Nano),
+            "level":   level.String(),
+            "message": fmt.Sprintf(format, args...),
+        }
+        if err := json.NewEncoder(buf).Encode(logEntry); err != nil {
+            l.handleError(fmt.Errorf("failed to encode JSON log entry: %v", err))
+            return
+        }
+    } else {
+        // Plain text format
+        timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+        fmt.Fprintf(buf, "[%s] [%s] ", timestamp, level.String())
+        fmt.Fprintf(buf, format, args...)
+        buf.WriteByte('\n')
+    }
 
     l.mu.Lock()
     defer l.mu.Unlock()
 
-    // Check if rotation is needed before writing.
     if l.shouldRotate(buf.Len()) {
         if err := l.rotateFile(); err != nil {
-            fmt.Fprintf(os.Stderr, "log rotation failed: %v\n", err)
-            return // Do not write the log if rotation fails.
-        }
-    }
-
-    // Write to the buffered writer.
-    if l.writer != nil {
-        n, err := l.writer.Write(buf.Bytes())
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "failed to write to log file: %v\n", err)
+            l.handleError(fmt.Errorf("log rotation failed: %v", err))
             return
         }
-        l.currentSize += int64(n)
     }
 
-    // Also write to stdout if enabled.
-    if l.config.EnableStdout {
-        os.Stdout.Write(buf.Bytes())
+    if l.out != nil {
+        n, err := l.out.Write(buf.Bytes())
+        if err != nil {
+            l.handleError(fmt.Errorf("failed to write to log output: %v", err))
+            return
+        }
+        // We only track the size written to the main file, not other outputs.
+        // This is a simplification. A more complex setup might track it differently.
+        l.currentSize += int64(n)
     }
 }
 
@@ -305,35 +338,23 @@ func (l *Logger) Fatal(format string, args ...interface{}) {
 
 // syncAndExit safely flushes, syncs the log file, and then exits.
 func (l *Logger) syncAndExit() {
-    // Use a separate goroutine with a timeout to prevent hanging on a blocked lock.
     done := make(chan struct{})
     go func() {
         defer close(done)
-        l.mu.Lock()
-        defer l.mu.Unlock()
-        if l.writer != nil {
-            l.writer.Flush()
-        }
-        if l.file != nil {
-            l.file.Sync()
-        }
+        l.Sync()
     }()
 
-    // Wait for the sync to complete or timeout.
     select {
     case <-done:
-        // Sync completed successfully.
+        // Sync completed.
     case <-time.After(5 * time.Second):
-        // Timeout - force exit to prevent the application from hanging.
-        fmt.Fprintf(os.Stderr, "Warning: Log sync timed out during fatal exit\n")
+        l.handleError(fmt.Errorf("log sync timed out during fatal exit"))
     }
-
     os.Exit(1)
 }
 
 // cleanupRoutine is a goroutine that periodically cleans up old log files.
 func (l *Logger) cleanupRoutine() {
-    // Check for old files to clean up once per hour.
     ticker := time.NewTicker(time.Hour)
     defer ticker.Stop()
 
@@ -354,7 +375,7 @@ func (l *Logger) syncRoutine() {
     for {
         select {
         case <-l.syncTicker.C:
-            l.Sync() // Use the public Sync method.
+            l.Sync()
         case <-l.stopChan:
             return
         }
@@ -368,31 +389,26 @@ func (l *Logger) cleanup() {
 
     files, err := l.getLogFiles()
     if err != nil {
-        fmt.Fprintf(os.Stderr, "failed to get log file list for cleanup: %v\n", err)
+        l.handleError(fmt.Errorf("failed to get log file list for cleanup: %v", err))
         return
     }
 
     now := time.Now()
     deleted := 0
 
-    // Sort files by modification time, newest first.
     sort.Slice(files, func(i, j int) bool {
         return files[i].ModTime().After(files[j].ModTime())
     })
 
     for i, file := range files {
-        // Skip the currently active log file.
         if file.Name() == l.config.FileName+".log" {
             continue
         }
 
         shouldDelete := false
-        // Check if the file is older than the configured max age.
         if l.config.MaxAge > 0 && now.Sub(file.ModTime()) > l.config.MaxAge {
             shouldDelete = true
         }
-
-        // Check if the number of backup files exceeds the configured limit.
         if l.config.MaxBackups > 0 && i >= l.config.MaxBackups {
             shouldDelete = true
         }
@@ -400,7 +416,7 @@ func (l *Logger) cleanup() {
         if shouldDelete {
             filePath := filepath.Join(l.config.LogDir, file.Name())
             if err := os.Remove(filePath); err != nil {
-                fmt.Fprintf(os.Stderr, "failed to delete old log file %s: %v\n", filePath, err)
+                l.handleError(fmt.Errorf("failed to delete old log file %s: %v", filePath, err))
             } else {
                 deleted++
             }
@@ -408,9 +424,7 @@ func (l *Logger) cleanup() {
     }
 
     if deleted > 0 {
-        // This message could be logged via the logger itself at a DEBUG level
-        // if further enhancements are made.
-        fmt.Printf("cleaned up %d old log files\n", deleted)
+        l.Debug("cleaned up %d old log files", deleted)
     }
 }
 
@@ -428,35 +442,35 @@ func (l *Logger) getLogFiles() ([]os.FileInfo, error) {
         if entry.IsDir() {
             continue
         }
-
         name := entry.Name()
-        // Match the current log file or backup files (both .log and .log.gz).
         if name == prefix+".log" ||
             (strings.HasPrefix(name, prefix+"_") && (strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz"))) {
             info, err := entry.Info()
             if err != nil {
-                continue // Skip files we can't get info for.
+                continue
             }
             logFiles = append(logFiles, info)
         }
     }
-
     return logFiles, nil
 }
 
 // Close closes the logger, ensuring all buffered logs are written to disk.
 func (l *Logger) Close() error {
-    // Stop background goroutines.
     close(l.stopChan)
-
     l.mu.Lock()
     defer l.mu.Unlock()
+    return l.close()
+}
 
-    if l.writer != nil {
-        l.writer.Flush()
+// close is the internal implementation of closing the logger.
+func (l *Logger) close() error {
+    if l.out != nil {
+        if f, ok := l.out.(io.Closer); ok {
+            f.Close()
+        }
     }
     if l.file != nil {
-        l.file.Sync()
         return l.file.Close()
     }
     return nil
@@ -481,21 +495,28 @@ func (l *Logger) Sync() error {
     l.mu.Lock()
     defer l.mu.Unlock()
 
-    if l.writer != nil {
-        if err := l.writer.Flush(); err != nil {
-            return err
+    // Flush the bufio.Writer part of the multi-writer
+    if f, ok := l.out.(*io.MultiWriter); ok {
+        for _, w := range getWriters(f) {
+            if b, ok := w.(*bufio.Writer); ok {
+                if err := b.Flush(); err != nil {
+                    return err
+                }
+            }
         }
     }
+
     if l.file != nil {
         return l.file.Sync()
     }
     return nil
 }
 
-// SetOutput is a placeholder for setting an additional output writer.
-// A more complete implementation would use io.MultiWriter.
-func (l *Logger) SetOutput(w io.Writer) {
-    // This method can be used to add additional output targets, such as network log collectors.
-    // A complete implementation would likely involve using an io.MultiWriter
-    // to write to both the file and the provided io.Writer.
+// A helper to get all writers from a MultiWriter, since it's not exported.
+// This is a bit of a hack and depends on the internal structure of MultiWriter.
+func getWriters(mw io.Writer) []io.Writer {
+    if mw, ok := mw.(interface{ Writers() []io.Writer }); ok {
+        return mw.Writers()
+    }
+    return []io.Writer{mw}
 }
