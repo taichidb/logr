@@ -33,22 +33,14 @@ const (
     FATAL
 )
 
+var levelStrings = [...]string{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
+
 // String returns the string representation of the log level.
 func (l LogLevel) String() string {
-    switch l {
-    case DEBUG:
-        return "DEBUG"
-    case INFO:
-        return "INFO"
-    case WARN:
-        return "WARN"
-    case ERROR:
-        return "ERROR"
-    case FATAL:
-        return "FATAL"
-    default:
-        return "UNKNOWN"
+    if l >= DEBUG && l <= FATAL {
+        return levelStrings[l]
     }
+    return "UNKNOWN"
 }
 
 // Config represents the logger configuration.
@@ -238,7 +230,7 @@ func (l *Logger) rotateFile() error {
         if err := l.compressFile(currentPath, backupPath); err != nil {
             l.openLogFile()
             return fmt.Errorf("failed to compress log file: %v", err)
-        }!
+        }
         if err := os.Remove(currentPath); err != nil {
             l.handleError(fmt.Errorf("failed to remove original log file after compression: %v", err))
         }
